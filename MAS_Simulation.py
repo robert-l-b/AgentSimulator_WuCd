@@ -12,6 +12,7 @@ import sys, getopt, os
 from datetime import datetime, timedelta
 import pytz
 import ast
+import time
 
 from source.train_test_split import split_data
 from source.agent_types.discover_roles import discover_roles_and_calendars
@@ -23,8 +24,13 @@ from source.extraneous_delays.config import (
     TimerPlacement,
 )
 from source.agent_types.discover_resource_calendar import discover_calendar_per_agent
+from source.warm_up_cool_down import get_wip_threshold, save_wip
+from source.warm_up_cool_down import cut_after_cool_down, cut_after_warm_up
+from source.warm_up_cool_down import check_hyperparameter, save_hyperparameter
 
 STEPS_TAKEN = []
+STEPS_TAKEN_warm_up = []
+counter_warm_up_cases = 0
 
 # helper functions
 def preprocess(df):
@@ -960,7 +966,7 @@ class ResourceAgent(Agent):
     """
     One agent for each of the resources in the event log
     """
-    def __init__(self, unique_id, model, resource, timer, contractor_agent=None):
+    def __init__(self, unique_id, model, resource, timer, contractor_agent=None, system_warmed_up=False):
         super().__init__(unique_id, model)
         self.resource = resource
         self.model = model
@@ -979,6 +985,9 @@ class ResourceAgent(Agent):
         self.timer = timer
         # print(f"agent {self.resource} has calendar {self.calendar}")
         self.occupied_times = []
+
+        # CHANGED: 
+        self.system_warmed_up = system_warmed_up
 
     def step(self, last_possible_agent=False, parallel_activity=False, current_timestamp=None, perform_multitask=False):
         # if len(self.contractor_agent.case.additional_next_activities) < 1:
@@ -1051,14 +1060,61 @@ class ResourceAgent(Agent):
                     index_to_delete = self.contractor_agent.case.additional_next_activities.index(activity)
                     self.contractor_agent.case.additional_next_activities.pop(index_to_delete)
 
-
-                STEPS_TAKEN.append({'case_id': self.contractor_agent.case.case_id, 
+                event = {'case_id': self.contractor_agent.case.case_id, 
                                     'agent': self.resource, 
                                     'activity_name': activity,
                                     'start_timestamp': current_timestamp,
                                     'end_timestamp': self.contractor_agent.case.current_timestamp,
                                     'TimeStep': self.model.schedule.steps,
-                                    })
+                                    }
+                #  CHANGED: use global parameter
+                # global system_warmed_up
+
+                # CHANGED: logic to determine whether events should not be logged due to warming up (or cool down?)
+                
+                # if system_warmed_up:
+                #     print('warm_up_system:',  warm_up_system, ' system_warmed_up:', system_warmed_up)
+                # if warm_up_system and self.system_warmed_up==False:
+                #     STEPS_TAKEN_warm_up.append(event)
+
+
+                #     simulated_log_warm_up = pd.DataFrame(STEPS_TAKEN_warm_up)
+                #     wip_warm_up = get_wip_threshold(simulated_log_warm_up, timedelta='D')
+                #     # print(len(wip_warm_up), type(wip_warm_up), wip_warm_up)
+                    
+                #     # check if warming up criterium is fulfilled
+                #     # print(np.max(wip_warm_up))
+                #     simulated_log_warm_up.to_csv('simulated_log_warm_up.csv')
+                #     print(len(wip_warm_up), np.max(wip_warm_up), np.max(wip_warm_up) > wip_threshold, wip_threshold)
+
+                    
+                #     if np.max(wip_warm_up) > wip_threshold:
+                        
+                #         self.system_warmed_up = True
+                #         print(wip_warm_up, np.max(wip_warm_up), np.max(wip_warm_up) > wip_threshold, wip_threshold)
+                #         # print('check reached:', simulated_log_warm_up['case_id'].nunique())
+                #         # raise ValueError('wating length reached')
+
+                #     # check if warming up criterium is fulfilled
+                #     # if warmed_up_state_reached:
+                #     #     system_warmed_up = True
+
+                # else:
+                # CHANGED: print test
+                # print(' ## Normal simulation reached')
+
+                # CHANGED: add event only to steps_taken if case_id was not already in warm up phase
+                # case_ids_warm_up = [item['case_id'] for item in STEPS_TAKEN_warm_up if 'case_id' in item]
+                # print(type(warm_up_steps), len(warm_up_steps), warm_up_steps[:5])
+                # if len(warm_up_steps)>0:
+                #     case_ids_warm_up = [item['case_id'] for item in warm_up_steps if 'case_id' in item]
+                #     if event['case_id'] not in case_ids_warm_up:
+                #         STEPS_TAKEN.append(event)
+                #     # else:
+                #     #     counter_warm_up_cases +=1
+                # else:
+                STEPS_TAKEN.append(event)
+
             else:
                 # print(f"#######agent {self.resource} is free but time not within calendar")
                 if last_possible_agent: # then increase timer by x seconds to try to get an available agent later
@@ -1572,7 +1628,7 @@ class BusinessProcessModel(Model):
                  start_timestamp, agent_activity_mapping, transition_probabilities, prerequisites, 
                  parallel_activities, max_activity_count_per_case, parallels_probs_dict, timer, 
                  discover_parallel_work, multitasking_probs_per_resource, max_multitasking_activities, 
-                 activities_without_waiting_time, agent_transition_probabilities, central_orchestration):
+                 activities_without_waiting_time, agent_transition_probabilities, central_orchestration, system_warmed_up):
         self.data = data
         self.resources = sorted(set(self.data['agent']))
         activities = sorted(set(self.data['activity_name']))
@@ -1601,13 +1657,15 @@ class BusinessProcessModel(Model):
 
         self.central_orchestration = central_orchestration
 
+        self.system_warmed_up = system_warmed_up
+
         self.schedule = MyScheduler(self,)
 
         self.contractor_agent = ContractorAgent(unique_id=9999, model=self, activities=activities, transition_probabilities=transition_probabilities, agent_activity_mapping=agent_activity_mapping)
         self.schedule.add(self.contractor_agent)
 
         for agent_id in range(len(self.resources)):
-            agent = ResourceAgent(agent_id, self, self.resources[agent_id], self.timer, self.contractor_agent)
+            agent = ResourceAgent(agent_id, self, self.resources[agent_id], self.timer, self.contractor_agent, self.system_warmed_up)
             self.schedule.add(agent)
 
         # Data collector to track agent activities over time
@@ -1695,14 +1753,19 @@ def catch_parameter(opt):
     """Change the captured parameters names"""
     switch = {'--log_path': 'log_path', '--train_path': 'train_path', '--test_path': 'test_path', '--case_id': 'case_id', '--activity_name': 'activity_name', 
               '--resource_name': 'resource_name', '--end_timestamp': 'end_timestamp', '--start_timestamp': 'start_timestamp', '--extr_delays': 'extr_delays', 
-              '--parallel_work': 'parallel_work', '--multi_task': 'multi_task', '--central_orchestration': 'central_orchestration'}
+              '--parallel_work': 'parallel_work', '--multi_task': 'multi_task', '--central_orchestration': 'central_orchestration',
+              '--warm_up_system': 'warm_up_system', '--cool_down_system': 'cool_down_system'}
     return switch.get(opt) 
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     opts, args = getopt.getopt(sys.argv[1:], "", ["log_path=", "train_path=", "test_path=", "case_id=", "activity_name=", 
                                                   "resource_name=", "end_timestamp=", "start_timestamp=", "extr_delays=", 
-                                                  "parallel_work=", "multi_task=", "central_orchestration="])
+                                                  "parallel_work=", "multi_task=", "central_orchestration=", 
+                                                  'warm_up_system=', 'cool_down_system='])
+    
+    start_time_total = time.time()
+
     train_and_test = True
     column_names = {}
     discover_extr_delays = False
@@ -1710,7 +1773,23 @@ if __name__ == "__main__":
     discover_parallel_work = False
     discover_multitask = False
     central_orchestration = False
+    ## CHANGED: from True to False
     determine_automatically = True
+    ## CHANGED: added parameter for warm-up and cool-down phases
+    # parameter whether system has done this phase
+    # global system_warmed_up
+    system_warmed_up   = False
+    system_cooled_down = False
+    # parameters handed over stipulating whether the phases should be enacted
+    warm_up_system     = False
+    cool_down_system   = False
+    ## CHANGED: Warm up criterium variable
+    warmed_up_state_reached = None
+    wip_threshold = None
+
+    file_path_hyperparams = 'hyperparameter.pkl'
+
+
     for opt, arg in opts:
         key = catch_parameter(opt)
         if key in ["log_path"]:
@@ -1740,9 +1819,30 @@ if __name__ == "__main__":
             if arg == "True":
                 central_orchestration = True
             determine_automatically = False
-            
+
+        # CHANGED: Added parameter setting in case of set to true
+        if key in ['warm_up_system']:
+            if arg == 'True':
+                warm_up_system = True
+        if key in ['cool_down_system']:
+            if arg == 'True':
+                cool_down_system = True
+
+
+
+    # print('###\nsystem_warmed_up: ', system_warmed_up, 
+    #       '\nsystem_cooled_down: ', system_cooled_down, 
+    #       '\nwarm_up_system: ', warm_up_system, 
+    #       '\ncool_down_system: ', cool_down_system )
+    # raise KeyError('break here')
 
     file_name = os.path.splitext(os.path.basename(PATH_LOG))[0]
+
+    # CHANGED: correct output path name
+    if file_name == 'train_log':
+        parent_directory = os.path.dirname(PATH_LOG)
+        file_name = os.path.basename(parent_directory)
+
     if determine_automatically:
         print("Choice for architecture and extraneous delays will be determined automatically")
         file_name_extension = 'main_results'
@@ -1751,10 +1851,25 @@ if __name__ == "__main__":
             file_name_extension = 'orchestrated'
         else:
             file_name_extension = 'autonomous'
+    # CHANGED: amended file path
+    if warm_up_system and cool_down_system:
+        file_name_extension = 'warm_up_cool_down'
+    elif warm_up_system and not cool_down_system:
+        file_name_extension = 'warm_up'
+    elif not warm_up_system and cool_down_system:
+        file_name_extension = 'cool_down'
+
+    print('train_and_test:',  train_and_test)
     if train_and_test:
+        print(PATH_LOG, PATH_LOG_test)
         business_process_data, df_test, num_cases_to_simulate = split_data(PATH_LOG, column_names, PATH_LOG_test)
     else:
         business_process_data, df_test, num_cases_to_simulate = split_data(PATH_LOG, column_names)
+
+    # CHANGED: extended numbers of cases to simulate
+    num_cases_to_simulate_orig = num_cases_to_simulate
+    if cool_down_system:
+        num_cases_to_simulate = num_cases_to_simulate * 2
 
     def extract_last_20_percent(df):
         df_sorted = df.sort_values(by=['case_id', 'start_timestamp'])
@@ -1773,6 +1888,20 @@ if __name__ == "__main__":
     business_process_data, AGENT_TO_RESOURCE = preprocess(business_process_data)
     df_test, _ = preprocess(df_test)
     df_val, _ = preprocess(df_val)
+
+
+    #### CHANGED: get wip per day and set wip threshold to median of daily wips
+    if warm_up_system:
+        print('Start preprocessing: WIP Threshold')
+        start_time = time.time()
+        wip = get_wip_threshold(business_process_data, timedelta='D')
+        wip_threshold =  np.median(wip)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        hours, remainder = divmod(execution_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"Execution time WIP calculation: {int(hours):02}:{int(minutes):02}:{int(seconds):02}")
+        save_wip(file_path='wip/wip_overview.pkl', identifier=file_name, wip=wip)
 
     # compute mean and std of activity durations
     activity_durations_dict = compute_activity_duration_distribution(business_process_data)
@@ -1809,6 +1938,7 @@ if __name__ == "__main__":
     # each simulated log starts at the time when the last case of the validation log starts
     # start_timestamp = max(business_process_data.groupby('case_id')['start_timestamp'].min().to_list())
     start_timestamp = min(df_test.groupby('case_id')['start_timestamp'].min().to_list())
+    start_timestamp_orig = start_timestamp
     start_timestamp_val = min(df_val.groupby('case_id')['start_timestamp'].min().to_list())
     # print(f"######## start timestamp for simulation: {start_timestamp}")
 
@@ -1837,34 +1967,94 @@ if __name__ == "__main__":
 
     date_of_current_timestamp = start_timestamp
     day_of_current_timestamp = date_of_current_timestamp.strftime('%A').upper()
-    sampled_cases = []
+    
 
     first_day = True
 
-    while len(sampled_cases) <= num_cases_to_simulate:
-        date_string = date_of_current_timestamp.strftime('%Y-%m-%d')
-        if day_of_current_timestamp in min_max_time_per_day.keys():
-            # date_string = start_timestamp.strftime('%Y-%m-%d')
-            min_timestamp = min_max_time_per_day[day_of_current_timestamp][0].time().strftime('%H:%M:%S')
-            max_timestamp = min_max_time_per_day[day_of_current_timestamp][1].time().strftime('%H:%M:%S')
-            x = round(average_occurrences_by_day[day_of_current_timestamp][0])
+    def create_sampled_cases(num_cases_to_simulate, start_timestamp, date_of_current_timestamp, 
+                             day_of_current_timestamp, arrival_distribution, first_day):
+        sampled_cases = []
+        while len(sampled_cases) <= num_cases_to_simulate:
+            date_string = date_of_current_timestamp.strftime('%Y-%m-%d')
+            if day_of_current_timestamp in min_max_time_per_day.keys():
+                # date_string = start_timestamp.strftime('%Y-%m-%d')
+                min_timestamp = min_max_time_per_day[day_of_current_timestamp][0].time().strftime('%H:%M:%S')
+                max_timestamp = min_max_time_per_day[day_of_current_timestamp][1].time().strftime('%H:%M:%S')
+                x = round(average_occurrences_by_day[day_of_current_timestamp][0])
 
-            times = random_sample_timestamps_(date_string, min_timestamp, max_timestamp, x, 
-                                              arrival_distribution, first_day, start_timestamp)
-            first_day = False
+                times = random_sample_timestamps_(date_string, min_timestamp, max_timestamp, x, 
+                                                arrival_distribution, first_day, start_timestamp)
+                first_day = False
 
-            # sampled_cases.append(times)
-            sampled_cases.extend(times)
-            # sampled_cases = [item for sublist in sampled_cases for item in sublist]
+                # sampled_cases.append(times)
+                sampled_cases.extend(times)
+                # sampled_cases = [item for sublist in sampled_cases for item in sublist]
 
-            day_of_current_timestamp = increment_day_of_week(day_of_current_timestamp)
-            date_of_current_timestamp += pd.Timedelta(days=1)
+                day_of_current_timestamp = increment_day_of_week(day_of_current_timestamp)
+                date_of_current_timestamp += pd.Timedelta(days=1)
+            
+            else:
+                day_of_current_timestamp = increment_day_of_week(day_of_current_timestamp)
+                date_of_current_timestamp += pd.Timedelta(days=1)
+
+        sampled_cases = sampled_cases[:num_cases_to_simulate + 1]
+        return sampled_cases
+    
+   
+    def create_sampled_cases_revert(num_cases_to_simulate, start_timestamp, date_of_current_timestamp, 
+                         day_of_current_timestamp, arrival_distribution, first_day):
+        sampled_cases = []
         
-        else:
-            day_of_current_timestamp = increment_day_of_week(day_of_current_timestamp)
-            date_of_current_timestamp += pd.Timedelta(days=1)
+        # Start going back in time
+        while len(sampled_cases) < num_cases_to_simulate:
+            date_string = date_of_current_timestamp.strftime('%Y-%m-%d')
+            
+            # Check if the current day has min/max time data
+            if day_of_current_timestamp in min_max_time_per_day.keys():
+                min_timestamp = min_max_time_per_day[day_of_current_timestamp][0].time().strftime('%H:%M:%S')
+                max_timestamp = min_max_time_per_day[day_of_current_timestamp][1].time().strftime('%H:%M:%S')
+                x = round(average_occurrences_by_day[day_of_current_timestamp][0])
+                
+                # Generate timestamps without modifying min/max, but ensuring they are earlier than start_timestamp
+                times = random_sample_timestamps_(date_string, min_timestamp, max_timestamp, x, 
+                                                arrival_distribution, first_day, start_timestamp)
+                first_day = False
+                
+                # Filter out the start_timestamp itself (if present)
+                filtered_times = [t for t in times if t < start_timestamp]
+                
+                # Add the valid timestamps to the sampled_cases list
+                sampled_cases.extend(filtered_times)
 
-    sampled_cases = sampled_cases[:num_cases_to_simulate + 1]
+            # Move to the previous day
+            day_of_current_timestamp = decrement_day_of_week(day_of_current_timestamp)
+            date_of_current_timestamp -= pd.Timedelta(days=1)
+        
+        # # Trim to the desired number of cases
+        sampled_cases = sampled_cases[:num_cases_to_simulate]
+
+        # Sort the final list to return in ascending order
+        sampled_cases.sort()
+
+        # check if len(sampled_cases)==num_cases_to_simulate
+        if len(sampled_cases)!=num_cases_to_simulate:
+            print(f'length not sufficient.sampled_cases: {len(sampled_cases)}, num_cases_to_simulate: {num_cases_to_simulate}')
+        
+        return sampled_cases
+
+    # Assuming you have this helper function for going back in time through the days of the week
+    def decrement_day_of_week(day_of_week):
+        days_mapping = {
+            'MONDAY': 0, 'TUESDAY': 1, 'WEDNESDAY': 2,
+            'THURSDAY': 3, 'FRIDAY': 4, 'SATURDAY': 5, 'SUNDAY': 6
+        }
+        current_day_numeric = days_mapping[day_of_week]
+        previous_day_numeric = (current_day_numeric - 1) % 7
+        previous_day_of_week = [day for day, value in days_mapping.items() if value == previous_day_numeric][0]
+        return previous_day_of_week
+
+    sampled_cases = create_sampled_cases(num_cases_to_simulate, start_timestamp, date_of_current_timestamp, 
+                                         day_of_current_timestamp, arrival_distribution, first_day)
 
     ### do the same for validation
     date_of_current_timestamp_val = start_timestamp_val
@@ -1964,10 +2154,26 @@ if __name__ == "__main__":
 
         return timers
     
+    ## CHANGED: added if statement
+    # if discover_delays:
     timers_extr = get_times_for_extrt_delays(discover_extr_delays=True)
     timers = get_times_for_extrt_delays(discover_extr_delays=False)
 
+
+    if determine_automatically:
+        discover_delays, central_orchestration = check_hyperparameter(file_path_hyperparams, file_name)
+        if discover_delays != None and central_orchestration != None:
+
+            if discover_delays:
+                timers = timers_extr
+            if not central_orchestration:
+                transition_probabilities = transition_probabilities_autonomous
+                agent_transition_probabilities = agent_transition_probabilities_autonomous
+
+            determine_automatically = False
+
     if determine_automatically:   
+
         # 1) simulate val log with extr delays and central orchestration
         discover_extr_delays = True
         central_orchestration = True
@@ -1983,7 +2189,7 @@ if __name__ == "__main__":
                                                         agent_activity_mapping, transition_probabilities, prerequisites, parallel_activities,
                                                         max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
                                                         multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
-                                                        agent_transition_probabilities, central_orchestration)
+                                                        agent_transition_probabilities, central_orchestration, system_warmed_up)
 
         # define list of cases
         case_id = 0
@@ -2010,7 +2216,7 @@ if __name__ == "__main__":
                                                         agent_activity_mapping, transition_probabilities, prerequisites, parallel_activities,
                                                         max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
                                                         multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
-                                                        agent_transition_probabilities, central_orchestration)
+                                                        agent_transition_probabilities, central_orchestration, system_warmed_up)
 
         # define list of cases
         case_id = 0
@@ -2039,7 +2245,7 @@ if __name__ == "__main__":
                                                         agent_activity_mapping, transition_probabilities_autonomous, prerequisites, parallel_activities,
                                                         max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
                                                         multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
-                                                        agent_transition_probabilities_autonomous, central_orchestration)
+                                                        agent_transition_probabilities_autonomous, central_orchestration, system_warmed_up)
 
         # define list of cases
         case_id = 0
@@ -2066,7 +2272,7 @@ if __name__ == "__main__":
                                                         agent_activity_mapping, transition_probabilities_autonomous, prerequisites, parallel_activities,
                                                         max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
                                                         multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
-                                                        agent_transition_probabilities_autonomous, central_orchestration)
+                                                        agent_transition_probabilities_autonomous, central_orchestration, system_warmed_up)
 
         # define list of cases
         case_id = 0
@@ -2144,7 +2350,12 @@ if __name__ == "__main__":
             discover_delays = False
             central_orchestration = False
             transition_probabilities = transition_probabilities_autonomous
-            agent_transition_probabilities = agent_transition_probabilities_autonomous         
+            agent_transition_probabilities = agent_transition_probabilities_autonomous
+
+
+        save_hyperparameter(file_path=file_path_hyperparams, file_name=file_name, discover_delays=discover_delays, central_orchestration=central_orchestration)
+
+
     else:
         if discover_delays:
             timers = timers_extr
@@ -2159,37 +2370,217 @@ if __name__ == "__main__":
     print(f"discover extr. delays: {discover_delays}")
     print(f"central orchestration: {central_orchestration}")
 
+    # def simulate_with_warm_up(business_process_model):
+    #     while not system_warmed_up:
 
-    # 6) simulate 10 times the test log
-    for i in range(10):
-        sampled_case_starting_times = sampled_cases
+    #     if warm_up_system and self.system_warmed_up==False:
+    #             STEPS_TAKEN_warm_up.append(event)
+
+
+    #             simulated_log_warm_up = pd.DataFrame(STEPS_TAKEN_warm_up)
+    #             wip_warm_up = get_wip_threshold(simulated_log_warm_up, timedelta='D')
+    #             # print(len(wip_warm_up), type(wip_warm_up), wip_warm_up)
+                
+    #             # check if warming up criterium is fulfilled
+    #             # print(np.max(wip_warm_up))
+    #             simulated_log_warm_up.to_csv('simulated_log_warm_up.csv')
+    #             print(len(wip_warm_up), np.max(wip_warm_up), np.max(wip_warm_up) > wip_threshold, wip_threshold)
+
+                
+    #             if np.max(wip_warm_up) > wip_threshold:
+                    
+    #                 self.system_warmed_up = True
+    #                 print(wip_warm_up, np.max(wip_warm_up), np.max(wip_warm_up) > wip_threshold, wip_threshold)
+    #                 # print('check reached:', simulated_log_warm_up['case_id'].nunique())
+    #                 # raise ValueError('wating length reached')
+
+    #             # check if warming up criterium is fulfilled
+    #             # if warmed_up_state_reached:
+    #             #     system_warmed_up = True
+
+
+    def simulate_with_warm_up(business_process_model, wip_threshold):
+        global system_warmed_up, sampled_cases, STEPS_TAKEN
+
+        warm_up_cases = []  # Separate list to manage warm-up cases
+        STEPS_TAKEN = []  # Reset steps for each warm-up attempt
+
+        case_id = 0
+        case_ = Case(case_id=case_id, start_timestamp=start_timestamp) # first case
+        # print('\n\n##### TYPE', type(start_timestamp))
+        warm_up_cases = [case_]
+        counter = 0
+        while business_process_model.sampled_case_starting_times:
+            business_process_model.step(warm_up_cases)
+            counter += 1
+            simulated_log_warm_up = pd.DataFrame(STEPS_TAKEN)
+        
+            warm_up_wip = get_wip_threshold(simulated_log_warm_up, timedelta='D')
+        # wip = get_wip_threshold(business_process_data, timedelta='D')
+        # wip_threshold = np.median(wip)
+            if np.max(warm_up_wip) > wip_threshold:
+                print(f"Warm-up successful. Max WIP reached: {np.max(warm_up_wip)}. Steps required: {counter}")
+                system_warmed_up = True
+                label = 'equal to median WIP of training data'
+                break
+            else:
+                label= 'that is the maximum of the entire warmup run'
+
+        # get max wip and its index
+        max_wip = np.max(warm_up_wip)
+        max_wip_index = warm_up_wip.index(max_wip)
+        timestamp_max_wip = start_timestamp + timedelta(days=max_wip_index)
+        count_in_range = sum(
+            start_timestamp <= timestamp <= timestamp_max_wip
+            for timestamp in sampled_case_starting_times
+        )
+        # print('max_wip', max_wip, 'max_wip_index', max_wip_index)
+        # print('warm_up_wip', warm_up_wip)
+        # print('start_timestamp', start_timestamp, 'timestamp_max_wip', timestamp_max_wip)
+        # print('COUNTINRANGE',count_in_range, sampled_case_starting_times[:2], sampled_case_starting_times[count_in_range-2:count_in_range], sampled_case_starting_times[count_in_range:])
+        print(f'Warm up results: {count_in_range} cases in {max_wip_index} days required to reach WIP {label}')
+
+
+        if not system_warmed_up:
+            print(f"Warm-up stoped after {counter} steps and {simulated_log_warm_up['case_id'].nunique()} distinct cases in warm up.")
+        
+        simulated_log_warm_up.to_csv('simulated_log_warm_up.csv')
+        save_wip(file_path='wip/wip_warm_up.pkl', identifier=file_name, wip=warm_up_wip)
+        save_wip(file_path='wip/amount_sampled_cases.pkl', identifier=file_name, wip=len(sampled_cases))
+        print('step counter:', counter)
+        
+
+        # Ensure all warm-up cases are completed, removed, or ignored
+        # warm_up_cases.clear()  # Clear unfinished warm-up cases
+        # return STEPS_TAKEN
+        return simulated_log_warm_up['case_id'].nunique()
+    
+
+
+    if warm_up_system:
+        STEPS_TAKEN = []
+        sampled_case_starting_times = sampled_cases[:num_cases_to_simulate_orig+1]
         start_timestamp = sampled_case_starting_times[0]
         sampled_case_starting_times = sampled_case_starting_times[1:]
+        counter_warm_up_cases = 0
+        print('length warm up:', len(sampled_case_starting_times))
 
+        # Create the model using the loaded data
+        business_process_model = BusinessProcessModel(business_process_data, activity_durations_dict, 
+                                                        sampled_case_starting_times, roles, res_calendars, start_timestamp,
+                                                        agent_activity_mapping, transition_probabilities, prerequisites, parallel_activities,
+                                                        max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
+                                                        multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
+                                                        agent_transition_probabilities, central_orchestration, system_warmed_up)
+
+
+    
+        # print('warm up check')
+        warm_up_cases_nr = simulate_with_warm_up(business_process_model, wip_threshold)
+        
+        sampled_cases_warm_up = create_sampled_cases_revert(num_cases_to_simulate=warm_up_cases_nr, start_timestamp=start_timestamp, date_of_current_timestamp=date_of_current_timestamp, 
+                                                    day_of_current_timestamp=day_of_current_timestamp, arrival_distribution=arrival_distribution, first_day=True)
+        
+        # print('warm_up_cases_nr', warm_up_cases_nr)
+        # print('length sampled cases', len(sampled_cases))
+        # print('sampled_cases length before warm_up :',len(sampled_cases))
+        sampled_cases = sampled_cases_warm_up + sampled_cases
+        # print('sampled_cases length after warm_up :',len(sampled_cases))
+
+    # 6) simulate 10 times the test log
+    # TO DO CHANGE BACK TO 10!
+    print('\n### Start simulation phase')
+    for i in range(10):
+        if warm_up_system:
+            sampled_case_starting_times = sampled_cases[:len(sampled_cases_warm_up)+num_cases_to_simulate_orig+1]
+        else:
+            sampled_case_starting_times = sampled_cases[:num_cases_to_simulate_orig+1]
+        # print('sampled_case_starting_times length before warm_up :',len(sampled_case_starting_times))
+        start_timestamp = sampled_case_starting_times[0]
+        sampled_case_starting_times = sampled_case_starting_times[1:]
+        counter_warm_up_cases = 0
+        # print(sampled_case_starting_times[:5])
+        # raise KeyError('end')
         # Create the model using the loaded data
         business_process_model = BusinessProcessModel(business_process_data, activity_durations_dict, 
                                                       sampled_case_starting_times, roles, res_calendars, start_timestamp,
                                                       agent_activity_mapping, transition_probabilities, prerequisites, parallel_activities,
                                                       max_activity_count_per_case, parallels_probs_dict, timers, discover_parallel_work, 
                                                       multitasking_probs_per_resource, max_multitasking_activities, activities_without_waiting_time,
-                                                      agent_transition_probabilities, central_orchestration)
+                                                      agent_transition_probabilities, central_orchestration, system_warmed_up)
+
+
+        # warm_up_steps = []
+        # if warm_up_system:
+        #     # print('warm up check')
+        #     warm_up_steps = simulate_with_warm_up(business_process_model, wip_threshold)
+        
+        # if warm_up_system:
+        #     STEPS_TAKEN.clear() 
+        
+        #     # print('sampled_case_starting_times before', len(sampled_case_starting_times))
+        #     sampled_case_starting_times = sampled_case_starting_times[:num_cases_to_simulate_orig]
+        #     # print('sampled_case_starting_times after', len(sampled_case_starting_times))
+        #     # reset parameters in model
+        #     business_process_model.sampled_case_starting_times = sampled_case_starting_times
+        #     # print(business_process_model.sampled_case_starting_times[:5])
+        #     business_process_model.maximum_case_id = 0
+
+        
+        if cool_down_system:
+            # print('cool down system', 'sampled cases', len(sampled_cases))
+            # extend to be simulated cases
+            sampled_case_starting_times = sampled_cases
+            business_process_model.sampled_case_starting_times = sampled_case_starting_times
+            start_timestamp = sampled_case_starting_times[0]
+            sampled_case_starting_times = sampled_case_starting_times[1:]
+            counter_warm_up_cases = 0
+
+        # CONTINUE HERE '''''''''
+        # sampled_cases = create_sampled_cases(num_cases_to_simulate, start_timestamp, date_of_current_timestamp, 
+                                        #  day_of_current_timestamp, arrival_distribution, first_day)
 
         # define list of cases
         case_id = 0
         case_ = Case(case_id=case_id, start_timestamp=start_timestamp) # first case
         cases = [case_]
 
+        # print(len(business_process_model.sampled_case_starting_times))
+        # print(type(business_process_model.sampled_case_starting_times))
+        # print(business_process_model.sampled_case_starting_times[:5])
+        # raise KeyError()
+
+
         # Run the model for a specified number of steps
         while business_process_model.sampled_case_starting_times: # while cases list is not empty
             business_process_model.step(cases)
             
-        print(f"number of simulated cases: {len(business_process_model.past_cases)}")
-
 
         # Record steps taken by each agent to a single CSV file
         simulated_log = pd.DataFrame(STEPS_TAKEN)
+        
+        print(f"number of simulated cases: {len(business_process_model.past_cases)}") #, of which {len(business_process_model.sampled_case_starting_times)} were completed.")
+        
         # add resource column
+        # REMOVE:
+        # print(len(STEPS_TAKEN), simulated_log.shape, simulated_log.columns)
+        print('unique case ids in sim log before pruning: ', simulated_log['case_id'].nunique())
+
         simulated_log['resource'] = simulated_log['agent'].map(AGENT_TO_RESOURCE)
+
+        if warm_up_system:
+            # print('unique case ids BEFORE pruning sim log from warm up: ', simulated_log['case_id'].nunique())
+            simulated_log = cut_after_warm_up(simulated_log, start_timestamp_orig)
+            # print('num_cases_to_simulate:', num_cases_to_simulate_orig, 'unique case ids after pruning sim log from warm up: ', simulated_log['case_id'].nunique(), '\n\n')
+
+        ## CHANGED: added removal of remaining simulation
+        if cool_down_system:
+            # print('unique case ids BEFORE pruning in sim log: ', simulated_log['case_id'].nunique())
+            simulated_log = cut_after_cool_down(simulated_log, num_cases_to_simulate_orig)
+            # print('num_cases_to_simulate:', num_cases_to_simulate_orig, 'unique case ids after pruning in sim log: ', simulated_log['case_id'].nunique(), '\n\n')
+
+        print('unique case ids in sim log after pruning: ', simulated_log['case_id'].nunique())
+
         # save log to csv
         path_to_file = os.path.join(data_dir,f"simulated_log_{i}.csv")
         simulated_log.to_csv(path_to_file, index=False)
@@ -2197,4 +2588,18 @@ if __name__ == "__main__":
 
         # reset STEPS_TAKEN
         STEPS_TAKEN = []
+        STEPS_TAKEN_warm_up = []
+        ## CHANGED: added parameter for warm-up and cool-down phases
+        # parameter whether system has done this phase
+        # global system_warmed_up 
+        system_warmed_up   = False
+        system_cooled_down = False
+        counter_warm_up_cases = 0
+
     print(f"configuration setting: orchestrated handovers: {central_orchestration}, extr. delays: {discover_delays}")
+
+    end_time_total = time.time()
+    execution_time_total = end_time_total - start_time_total
+    hours, remainder = divmod(execution_time_total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Total Execution time: {int(hours):02}:{int(minutes):02}:{int(seconds):02}\n")
